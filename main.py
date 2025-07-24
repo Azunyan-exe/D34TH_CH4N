@@ -1,5 +1,3 @@
-# --- Improved Telegram Bot Code ---
-
 import os
 import re
 import time
@@ -8,11 +6,10 @@ import subprocess
 import uuid
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=".env")  # Make sure .env is present in the same directory
+load_dotenv(dotenv_path=".env")  # Ensure .env contains BOT_TOKEN and FORWARD_TO_ID
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FORWARD_TO_ID = os.getenv("FORWARD_TO_ID")
-
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
@@ -32,13 +29,13 @@ def send_video(chat_id, file_path, caption=None):
 
 def fetch_lyrics(song_query):
     try:
-        response = requests.get(f"https://api.lyrics.ovh/v1/{song_query}", timeout=10)
-        if response.status_code == 200:
-            return response.json().get("lyrics", "No lyrics found.")
-        else:
-            return "Lyrics not found."
+        artist, song = song_query.split(" - ", 1)
+        res = requests.get(f"https://api.lyrics.lewagon.ai/v1/{artist}/{song}", timeout=10)
+        if res.status_code == 200:
+            return res.json().get("lyrics", "No lyrics found.")
+        return "Lyrics not found."
     except:
-        return "Lyrics fetch error."
+        return "❌ Could not fetch lyrics. Use: @lyrics Artist - Song Name"
 
 
 def fetch_anime_info(anime_name):
@@ -61,13 +58,25 @@ def fetch_anime_info(anime_name):
     """
     variables = {"search": anime_name}
     url = "https://graphql.anilist.co"
-    response = requests.post(url, json={"query": query, "variables": variables})
-    data = response.json()
-    media = data.get("data", {}).get("Media")
-    if not media:
-        return "Anime not found."
+    try:
+        response = requests.post(url, json={"query": query, "variables": variables})
+        data = response.json()
+        media = data.get("data", {}).get("Media")
+        if not media:
+            return "Anime not found."
 
-    return f"Title: {media['title']['romaji']}\nStatus: {media['status']}\nEpisodes: {media['episodes']}\nScore: {media['averageScore']}\nDescription: {media['description'][:300]}..."
+        title = f"{media['title']['english']} ({media['title']['romaji']})" if media['title']['english'] else media['title']['romaji']
+        description = re.sub('<[^<]+?>', '', media['description'])[:600] + "..."
+        return (
+            f"📺 *{title}*\n"
+            f"🎯 *Status:* {media['status']}\n"
+            f"🎬 *Episodes:* {media['episodes']}\n"
+            f"⭐ *Score:* {media['averageScore']}\n"
+            f"📝 *Description:* {description}\n"
+            f"[📷 Cover Image]({media['coverImage']['large']})"
+        )
+    except Exception as e:
+        return f"❌ Error fetching anime info: {e}"
 
 
 def handle_user_message(message):
@@ -75,51 +84,72 @@ def handle_user_message(message):
     user_msg = message.get("text", "")
 
     if user_msg.startswith("/start"):
-        send_message(chat_id, "👋 Welcome to the Music & Anime Bot! Use /help to see all features.")
+        send_message(chat_id, "👋 Welcome to the Music & Anime Bot!\nUse /help to see features.")
         return
 
     if user_msg.startswith("/help"):
-        send_message(chat_id, "Here are commands you can use:\n- Send a Spotify/YouTube link to get audio\n- Send Instagram reel link for video\n- @lyrics SongName - ArtistName\n- @animeinfo AnimeName")
+        send_message(chat_id, (
+            "Here are commands you can use:\n"
+            "- Paste any YouTube/Instagram/Spotify link for audio/video\n"
+            "- @lyrics Artist - SongName\n"
+            "- @animeinfo AnimeName"
+        ))
         return
 
-    # Forward all messages to private group
+    # Forward to private group
     requests.post(f"{API_URL}/forwardMessage", json={
         "chat_id": FORWARD_TO_ID,
         "from_chat_id": chat_id,
         "message_id": message["message_id"]
     })
 
-    # Handle Lyrics Command
+    # @lyrics command
     if user_msg.startswith("@lyrics"):
         song = user_msg.replace("@lyrics", "").strip()
         if not song:
-            send_message(chat_id, "Please provide song and artist: @lyrics SongName - Artist")
+            send_message(chat_id, "❗ Use like: @lyrics Eminem - Lose Yourself")
             return
         lyrics = fetch_lyrics(song)
-        send_message(chat_id, f"🎶 Lyrics for {song}:\n\n{lyrics[:4000]}")
+        send_message(chat_id, f"🎶 Lyrics for *{song}*:\n\n{lyrics[:4000]}")
         return
 
-    # Handle Anime Command
+    # @animeinfo command
     if user_msg.startswith("@animeinfo"):
         name = user_msg.replace("@animeinfo", "").strip()
         if not name:
-            send_message(chat_id, "Please provide an anime name like: @animeinfo Jujutsu Kaisen")
+            send_message(chat_id, "❗ Use like: @animeinfo Jujutsu Kaisen")
             return
         info = fetch_anime_info(name)
-        send_message(chat_id, info)
+        requests.post(f"{API_URL}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": info,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False
+        })
         return
 
-    # Handle Downloading Music/Video
-    yt_match = re.search(r"(https?://[\w./?=-]+)", user_msg)
+    # URL handler (YT, Spotify, Instagram)
+    yt_match = re.search(r"(https?://[^\s]+)", user_msg)
     if yt_match:
         url = yt_match.group(1)
-        filename = str(uuid.uuid4()) + ".mp3"
+        is_instagram = "instagram.com" in url
+
+        extension = ".mp4" if is_instagram else ".mp3"
+        filename = str(uuid.uuid4()) + extension
+
+        send_message(chat_id, "⏬ Downloading... Please wait.")
         try:
-            send_message(chat_id, "🔄 Downloading your file, please wait...")
-            subprocess.run(["yt-dlp", "--extract-audio", "--audio-format", "mp3", "-o", filename, url], check=True)
-            send_audio(chat_id, filename)
+            cmd = ["yt-dlp", "-f", "best", "-o", filename, url] if is_instagram else [
+                "yt-dlp", "--extract-audio", "--audio-format", "mp3", "-o", filename, url
+            ]
+            subprocess.run(cmd, check=True)
+
+            if extension == ".mp4":
+                send_video(chat_id, filename)
+            else:
+                send_audio(chat_id, filename)
         except Exception as e:
-            send_message(chat_id, f"Download failed: {e}")
+            send_message(chat_id, f"❌ Download failed: {e}")
         finally:
             if os.path.exists(filename):
                 os.remove(filename)
@@ -133,13 +163,10 @@ def main():
     while True:
         response = requests.get(f"{API_URL}/getUpdates", params={"offset": offset, "timeout": 30})
         updates = response.json().get("result", [])
-
         for update in updates:
             offset = update["update_id"] + 1
-            message = update.get("message")
-            if message:
-                handle_user_message(message)
-
+            if "message" in update:
+                handle_user_message(update["message"])
         time.sleep(1)
 
 
